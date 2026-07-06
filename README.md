@@ -1,176 +1,109 @@
 # GitHub Issues → Discord フォーラム通知 Bot
 
-指定した複数リポジトリの Issue / コメントを **GitHub Actions 上で定期ポーリング** して、Discord の **フォーラムチャンネル** に通知する bot です。
-外部サーバーは不要です。Python スクリプトを GitHub Actions の `schedule` で定期実行し、状態 (`state.json`) をリポジトリにコミットして次回実行に引き継ぎます。
+GitHub Issue の作成・編集・クローズ・再オープン、およびコメントを Discord の **フォーラムチャンネル** に通知する GitHub Actions ワークフローです。
+
+**ファイル1つだけ** で完結します。Python も外部サーバーも不要です。
 
 ## 仕組み
 
 ```
-  ┌───────────────────────────────────────────────────────┐
-  │ GitHub Actions (cron: 5 分ごと)                       │
-  │                                                       │
-  │  1. actions/checkout でリポジトリを取得               │
-  │  2. Python スクリプト起動                              │
-  │     ・watched-repos.json から監視対象を読込           │
-  │     ・state.json の last_run 以降に更新された Issue    │
-  │       を各リポジトリごとに取得（PR は除外）           │
-  │     ・新規 Issue → Discord フォーラムに新規投稿作成   │
-  │     ・既存 Issue の状態変化 → スレッドに通知 + タグ切替 │
-  │     ・新規コメント → 同一スレッドに embed で追記       │
-  │  3. state.json を git commit & push                   │
-  └───────────────────────────────────────────────────────┘
-            │
-            ▼
-   Discord フォーラムチャンネル
+GitHub リポジトリ (ChihaluCoding/stackplus)
+  │
+  ├─ Issue 作成 ──────→ フォーラムに新規投稿 + Open タグ
+  ├─ Issue クローズ ──→ スレッドに通知 + Closed タグ + アーカイブ
+  ├─ Issue 再オープン → スレッド復帰 + Open タグ
+  ├─ Issue 編集 ──────→ スレッドに通知
+  └─ コメント追加 ────→ 同一スレッドに追記
 ```
 
-Issue ↔ Discord スレッドの紐付けは `state.json` 内の `issues` テーブル（キー: `owner/repo#番号`）で管理します。監視対象リポジトリ側には何も変更を加えません。
-
-## 監視できるリポジトリ
-
-- 自分が所有するリポジトリはもちろん、**他人の公開リポジトリ** も監視可能です
-- GitHub PAT (`public_repo` または `repo` スコープ) を使ってアクセスします
-- 1つのフォーラムチャンネルで複数のリポジトリの Issue を混在して管理できます（スレッド名に `[owner/repo]` プレフィックスが付きます）
+Issue ↔ Discord スレッドの紐付けは、Issue 本文末尾に HTML コメント `<!-- discord-thread:ID -->` を埋め込むことで管理します（Markdown 上は見えません）。
 
 ## 必要なもの
 
 - Discord Bot（[Developer Portal](https://discord.com/developers/applications) で作成）
-- Bot 権限: `Send Messages`, `Manage Threads`, `Read Message History`, `Apply Tags`
-- 通知先の **フォーラムチャンネル** と 3 つのタグ（Open / Closed / Reopened）
-- GitHub Personal Access Token (PAT) — `public_repo`（公開リポジトリ-only）または `repo`（プライベート含む）スコープ
+- Bot 権限: `Send Messages`, `Manage Threads`, `Read Message History`
+- 通知先の **フォーラムチャンネル** とタグ（Open / Closed / Reopened）
+- GitHub リポジトリのデフォルト `GITHUB_TOKEN`（PAT 不要）
 
 ## セットアップ手順
 
-### 1. Discord Bot を作成してサーバーに招待
+### 1. Discord Bot を作成
 
-1. <https://discord.com/developers/applications> で **New Application** を作成
-2. **Bot** タブで **Reset Token** → トークンをコピー
+1. <https://discord.com/developers/applications> → **New Application**
+2. **Bot** タブ → **Reset Token** → トークンをコピー
 3. **OAuth2 → URL Generator** で `bot` を選択
-4. 権限は `Send Messages`, `Manage Threads`, `Read Message History` を指定
-5. 生成された URL で Bot をサーバーに招待
+4. 権限: `Send Messages`, `Manage Threads`, `Read Message History`
+5. 生成 URL で Bot をサーバーに招待
 
 ### 2. フォーラムチャンネルとタグを作成
 
-1. サーバーで **チャンネル作成** → 種別を **フォーラム** に設定
-2. フォーラムにタグを 3 つ作成: `Open`, `Closed`, `Reopened`
-3. フォーラムチャンネルの権限設定で Bot を追加し `送信/スレッド管理` を許可
-4. [開発者モード](https://support.discord.com/hc/ja/articles/206343498) を有効化し、以下の ID を コピー:
+1. Discord サーバーで **フォーラム** チャンネルを作成
+2. タグを 3 つ作成: `Open`, `Closed`, `Reopened`
+3. フォーラムの権限で Bot に `送信/スレッド管理` を許可
+4. [開発者モード](https://support.discord.com/hc/ja/articles/206343498) を有効化し、ID をコピー:
    - フォーラムチャンネル ID
-   - `Open`, `Closed`, `Reopened` の各タグ ID
+   - Open / Closed / Reopened タグ ID
 
-### 3. GitHub パーソナルアクセストークン (PAT) を発行
+### 3. GitHub Secrets を登録
 
-1. GitHub の **Settings → Developer settings → Personal access tokens → Fine-grained tokens**（または Classic PAT）
-2. スコープ `public_repo`（公開のみ）または `repo`（プライベート含む）を付与
-3. トークンをコピー
+`ChihaluCoding/stackplus` リポジトリの **Settings → Secrets and variables → Actions** で以下を追加:
 
-### 4. GitHub リポジトリに Secret を登録
-
-ワークフローを置くリポジトリの **Settings → Secrets and variables → Actions** で以下を追加:
-
-| Secret 名 | 値 |
+| Name | Value |
 |---|---|
-| `GH_PAT` | GitHub PAT（手順3） |
-| `DISCORD_BOT_TOKEN` | Bot トークン（手順1） |
+| `DISCORD_BOT_TOKEN` | Bot トークン |
 | `DISCORD_FORUM_CHANNEL_ID` | フォーラムチャンネル ID |
 | `DISCORD_TAG_OPEN` | Open タグの ID |
 | `DISCORD_TAG_CLOSED` | Closed タグの ID |
 | `DISCORD_TAG_REOPENED` | Reopened タグの ID |
 
-### 5. 監視対象リポジトリを指定
+> `GITHUB_TOKEN` は自動で使われるため Secret 登録不要です。PAT も不要です。
 
-ルートの `watched-repos.json` を編集:
+### 4. ワークフローを配置
 
-```json
-{
-  "repos": [
-    "octocat/Hello-World",
-    "torvalds/linux",
-    "your-name/your-private-repo"
-  ]
-}
-```
-
-### 6. ワークフローを配置して push
+`.github/workflows/discord-notify.yml` を `ChihaluCoding/stackplus` リポジトリにコミット・プッシュ:
 
 ```bash
-git add .github/workflows/discord-notify.yml \
-        scripts/discord_forum_notify.py \
-        requirements.txt \
-        watched-repos.json
-git commit -m "Add Discord forum issue notifier"
+git add .github/workflows/discord-notify.yml
+git commit -m "Add Discord forum notification workflow"
 git push
 ```
 
-これで設定完了です。初回 push 時にはワークフローが起動し、`state.json` のベースライン時刻を記録して終了します（通知は送信されません）。次回以降の cron 実行から実際の通知が始まります。
+### 5. 既存 Issue を一括投稿（バックフィル）
 
-## 監視間隔（カスタマイズ）
+現在ある Issue も全て Discord に投稿したい場合:
 
-`.github/workflows/discord-notify.yml` の `cron` を編集します:
-
-```yaml
-schedule:
-  - cron: '*/5 * * * *'   # 5 分ごと（既定）
-  # - cron: '*/10 * * * *' # 10 分ごと
-  # - cron: '*/15 * * * *' # 15 分ごと
-  # - cron: '0 * * * *'    # 1 時間ごと
-```
-
-GitHub Actions の cron は分単位の最小刻みで、実際の起動は最大 数分 遅れることがあります。
+1. リポジトリの **Actions** タブ → **Discord Forum Notify**
+2. **Run workflow** をクリック
+3. `backfill` にチェックが入ったまま **Run workflow** をクリック
+4. 全 Issue がフォーラムに投稿される（クローズ済みはアーカイブ状態で作成）
 
 ## 通知されるイベント
 
 | イベント | 色 | 動作 |
 |---|---|---|
-| 新規 Issue 検出 | 青 | フォーラムに新規投稿作成 + `Open` タグ付与 |
-| Issue 編集 | 黄 | スレッドに embed 追記 |
-| Issue クローズ | 赤 | スレッドに通知 + `Closed` タグ付与 + アーカイブ・ロック |
-| Issue 再オープン | 緑 | スレッド復帰 + `Open` タグ付与 + 通知 |
-| 新規コメント | 緑 | 同一スレッドに embed 追記 |
-
-> **注**: GitHub API の `since` パラメータで「`last_run` 以降に `updated_at` 更新された Issue」を取得するため、コメントが付いた Issue もまとめて取得されます。コメントは個別に取得して重複を避けてスレッドへ送信します。
-
-## 手動での再取得（バックフィル）
-
-Actions タブから **Run workflow** を実行すると、`since` 入力欄に ISO8601 形式（例: `2026-07-01T00:00:00Z`）で時刻を指定して、その時刻以降の更新を再取得できます。この場合 `state.json` の `last_run` は上書きされません。
-
-## 初回実行の注意
-
-**初回実行時は、既存の Issue（オープン・クローズ済み問わず）を全て Discord フォーラムに投稿します。** Issue 本文のみが投稿され、過去のコメントはスキップされます（`last_comment_id` が最新コメントIDに設定されるため）。クローズ済みの Issue は作成後に自動アーカイブされます。
-
-2回目以降は `last_run` 以降に更新された Issue のみが処理されます。
-
-## トラブルシューティング
-
-- **ワークフローが全く起動しない**
-  - GitHub Actions の cron は `main` / `master` ブランチに置いたワークフローのみ実行されます
-  - リポジトリの Actions タブで「This scheduled workflow is disabled because there hasn't been activity in at least 60 days.」と表示されたら有効化ボタンを押してください
-- **`403 Forbidden` や `404 Not Found` でリポジトリ取得に失敗する**
-  - PAT のスコープが足りているか（プライベートなら `repo` 必須）
-  - リポジトリ名の `owner/repo` のつづりが正しいか確認
-- **`DISCORD 403` で forum thread 作成に失敗する**
-  - Bot がフォーラムチャンネルにアクセスできる権限か確認
-  - `Manage Threads` 権限が不足していないか確認
-- **同じコメントが重複して投稿される**
-  - `state.json` の `last_comment_id` が正しく更新されていない可能性があります
-  - `state.json` を手動編集して該当 Issue の `last_comment_id` を修正するか、該当エントリを削除してください
-- **長文の Issue 本文 / コメント本文**
-  - 自動的に 4096 字で切り詰められます（Discord Embed description の上限）
+| Issue 作成 | 青 | 新規フォーラム投稿 + `Open` タグ |
+| Issue 編集 | 黄 | スレッドに通知 |
+| Issue クローズ | 赤 | スレッド通知 + `Closed` タグ + アーカイブ |
+| Issue 再オープン | 緑 | スレッド復帰 + `Open` タグ |
+| コメント追加/編集/削除 | 緑/黄/赤 | 同一スレッドに追記 |
 
 ## ファイル構成
 
 ```
-.
-├── .github/
-│   └── workflows/
-│       └── discord-notify.yml       # 定期実行ワークフロー
-├── scripts/
-│   └── discord_forum_notify.py      # 通知スクリプト本体
-├── requirements.txt                 # Python 依存 (requests のみ)
-├── watched-repos.json               # 監視対象リポジトリ一覧
-├── state.json                       # 実行状態（bot が自動コミット）
-└── README.md
+.github/
+└── workflows/
+    └── discord-notify.yml    # これ1つだけ
 ```
+
+## トラブルシューティング
+
+- **`403 Forbidden`**
+  - Bot がフォーラムチャンネルにアクセスできるか確認
+  - `Manage Threads` 権限があるか確認
+- **コメントがスレッドに追記されない**
+  - Issue 本文から `<!-- discord-thread: -->` マーカーが消去されていないか確認
+- **バックフィルで一部失敗する**
+  - Discord レート制限（2秒/件の待機を入れています）。Issue が多い場合は時間がかかります
 
 ## License
 
