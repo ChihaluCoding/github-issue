@@ -1,0 +1,208 @@
+name: Notify Discord Forum on Issue
+
+on:
+  issues:
+    types: [opened, closed, reopened, edited]
+  issue_comment:
+    types: [created, edited, deleted]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync with Discord forum channel
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_FORUM_CHANNEL_ID: ${{ secrets.DISCORD_FORUM_CHANNEL_ID }}
+          DISCORD_TAG_OPEN: ${{ secrets.DISCORD_TAG_OPEN }}
+          DISCORD_TAG_CLOSED: ${{ secrets.DISCORD_TAG_CLOSED }}
+          DISCORD_TAG_REOPENED: ${{ secrets.DISCORD_TAG_REOPENED }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # ===== GitHub ペイロードから共通情報を取得 =====
+          EVENT_NAME="$GITHUB_EVENT_NAME"
+          ACTION=$(jq -r '.action' "$GITHUB_EVENT_PATH")
+          ISSUE_NUMBER=$(jq -r '.issue.number // empty' "$GITHUB_EVENT_PATH")
+          ISSUE_TITLE=$(jq -r '.issue.title // empty' "$GITHUB_EVENT_PATH")
+          ISSUE_URL=$(jq -r '.issue.html_url // empty' "$GITHUB_EVENT_PATH")
+          ISSUE_STATE=$(jq -r '.issue.state // empty' "$GITHUB_EVENT_PATH")
+          ISSUE_USER=$(jq -r '.issue.user.login // "unknown"' "$GITHUB_EVENT_PATH")
+          ISSUE_BODY=$(jq -r '.issue.body // ""' "$GITHUB_EVENT_PATH")
+          ACTOR=$(jq -r '.sender.login // "unknown"' "$GITHUB_EVENT_PATH")
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          echo "Event=$EVENT_NAME Action=$ACTION Issue=#$ISSUE_NUMBER"
+
+          # ===== issue_comment 用の追加情報 =====
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            COMMENT_BODY=$(jq -r '.comment.body // ""' "$GITHUB_EVENT_PATH")
+            COMMENT_URL=$(jq -r '.comment.html_url // .issue.html_url' "$GITHUB_EVENT_PATH")
+          fi
+
+          # ===== Issue 本文から紐付け用マーカーを抽出 =====
+          THREAD_ID=$(printf '%s' "$ISSUE_BODY" | grep -oP '<!-- discord-thread:\K[0-9]+(?= -->)' | tail -n1 || true)
+
+          # ===== embed の組み立て用ヘルパー =====
+          make_embed() {
+            local color="$1" title="$2" desc="$3" url="$4" footer="$5"
+            desc=$(printf '%s' "$desc" | cut -c1-4000)
+            jq -c -n \
+              --arg title "$title" \
+              --arg desc "$desc" \
+              --arg url "$url" \
+              --arg color "$color" \
+              --arg foot "$footer" \
+              --arg ts "$NOW" \
+              '{ title: $title, url: $url, color: ($color|tonumber), description: $desc, footer: { text: $foot }, timestamp: $ts }'
+          }
+
+          # Discord API を叩くヘルパー
+          discord_api() {
+            local method="$1" path="$2" payload="$3"
+            if [ -z "$payload" ]; then
+              curl -sS -w "\n%{http_code}" \
+                -X "$method" \
+                -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+                -H "Content-Type: application/json" \
+                "https://discord.com/api/v10$path"
+            else
+              curl -sS -w "\n%{http_code}" \
+                -X "$method" \
+                -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$payload" \
+                "https://discord.com/api/v10$path"
+            fi
+          }
+
+          check_http() {
+            local resp="$1" label="$2"
+            local code body
+            code=$(echo "$resp" | tail -n1)
+            body=$(echo "$resp" | sed '$d')
+            echo "$label -> HTTP $code"
+            if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+              echo "Discord API error body: $body"
+              exit 1
+            fi
+          }
+
+          # ===== 1. Issue 作成 → フォーラムに新規投稿作成 =====
+          if [ "$EVENT_NAME" = "issues" ] && [ "$ACTION" = "opened" ]; then
+            echo "Creating forum thread for new issue #$ISSUE_NUMBER"
+
+            THREAD_NAME=$(printf 'Issue #%s: %s' "$ISSUE_NUMBER" "$ISSUE_TITLE" | cut -c1-100)
+            EMBED=$(make_embed 3447003 "🆕 新しいIssueが作成されました" "$ISSUE_BODY" "$ISSUE_URL" "by @$ISSUE_USER • opened")
+            SUMMARY=$(printf 'Issue #%s created by @%s' "$ISSUE_NUMBER" "$ISSUE_USER")
+
+            PAYLOAD=$(jq -n \
+              --arg name "$THREAD_NAME" \
+              --arg content "$SUMMARY" \
+              --argjson embed "$EMBED" \
+              --argjson tags "$(jq -n --arg o "$DISCORD_TAG_OPEN" '[$o] | map(select(. != ""))')" \
+              '{
+                name: $name,
+                auto_archive_duration: 1440,
+                message: { content: $content, embeds: [$embed] },
+                applied_tags: $tags
+              }')
+
+            RESP=$(discord_api POST "/channels/$DISCORD_FORUM_CHANNEL_ID/threads" "$PAYLOAD")
+            check_http "$RESP" "create forum thread"
+            NEW_THREAD=$(echo "$RESP" | sed '$d' | jq -r '.id')
+            echo "Created Discord thread id=$NEW_THREAD"
+
+            # Issue 本体に隠しマーカーを追記
+            MARKER="<!-- discord-thread:$NEW_THREAD -->"
+            NEW_BODY=$(printf '%s\n%s' "$ISSUE_BODY" "$MARKER")
+            PATCH_PAYLOAD=$(jq -n --arg body "$NEW_BODY" '{ body: $body }')
+            curl -sS -o /dev/null -w "patch issue HTTP %{http_code}\n" \
+              -X PATCH \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -d "$PATCH_PAYLOAD" \
+              "https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER"
+
+            echo "Done for new issue."
+            exit 0
+          fi
+
+          # ===== 2. コメント作成/編集/削除 → スレッドへ追記 =====
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            if [ -z "$THREAD_ID" ]; then
+              echo "No discord-thread marker on issue body. Skipping comment notification."
+              exit 0
+            fi
+            echo "Found Discord thread $THREAD_ID for issue #$ISSUE_NUMBER"
+
+            case "$ACTION" in
+              created) COLOR=5793264;   TITLE="💬 新しいコメント";          DESC="$COMMENT_BODY" ;;
+              edited)  COLOR=15844367;  TITLE="✏️ コメントが編集されました"; DESC="$COMMENT_BODY" ;;
+              deleted) COLOR=10038562;  TITLE="🗑️ コメントが削除されました"; DESC="(コメントは削除されています)";;
+              *)      COLOR=8421504;   TITLE="ℹ️ コメント更新";             DESC="$COMMENT_BODY";;
+            esac
+
+            EMBED=$(make_embed "$COLOR" "$TITLE" "$DESC" "$COMMENT_URL" "by @$ACTOR • state: $ISSUE_STATE")
+            MSG_PAYLOAD=$(jq -n --argjson embed "$EMBED" '{ embeds: [$embed] }')
+            RESP=$(discord_api POST "/channels/$THREAD_ID/messages" "$MSG_PAYLOAD")
+            check_http "$RESP" "post comment to thread"
+            echo "Comment notification sent to Discord thread."
+            exit 0
+          fi
+
+          # ===== 3. クローズ/再オープン/編集 → スレッドへ追記 + タグ切替 =====
+          if [ "$EVENT_NAME" = "issues" ]; then
+            if [ -z "$THREAD_ID" ]; then
+              echo "No discord-thread marker on issue body. Skipping."
+              exit 0
+            fi
+            echo "Found Discord thread $THREAD_ID for issue #$ISSUE_NUMBER"
+
+            case "$ACTION" in
+              closed)
+                COLOR=10038562; TITLE="🔒 Issueがクローズされました"
+                NEW_TAG="$DISCORD_TAG_CLOSED"; DESC="このIssueはクローズされました。";;
+              reopened)
+                COLOR=3066993;  TITLE="♻️ Issueが再オープンされました"
+                NEW_TAG="$DISCORD_TAG_OPEN"; DESC="このIssueは再オープンされました。";;
+              edited)
+                COLOR=15844367; TITLE="✏️ Issueが編集されました"
+                NEW_TAG="$DISCORD_TAG_REOPENED"; DESC="$ISSUE_BODY";;
+              *)
+                COLOR=8421504;  TITLE="ℹ️ Issueの更新"
+                NEW_TAG="$DISCORD_TAG_OPEN"; DESC="$ISSUE_BODY";;
+            esac
+
+            # メッセージ追記
+            EMBED=$(make_embed "$COLOR" "$TITLE" "$DESC" "$ISSUE_URL" "by @$ACTOR • $ACTION • state: $ISSUE_STATE")
+            MSG_PAYLOAD=$(jq -n --argjson embed "$EMBED" '{ embeds: [$embed] }')
+            RESP=$(discord_api POST "/channels/$THREAD_ID/messages" "$MSG_PAYLOAD")
+            check_http "$RESP" "post status update to thread"
+
+            # フォーラム投稿のタグ更新
+            if [ -n "$NEW_TAG" ]; then
+              TAGS_PAYLOAD=$(jq -n --arg t "$NEW_TAG" '{ applied_tags: [$t] }')
+              RESP=$(discord_api PATCH "/channels/$THREAD_ID" "$TAGS_PAYLOAD")
+              check_http "$RESP" "update thread tags"
+              echo "Updated thread tag to $NEW_TAG"
+            fi
+
+            # クローズ時はスレッドをアーカイブ
+            if [ "$ACTION" = "closed" ]; then
+              ARCHIVE_PAYLOAD='{"archived": true, "locked": true}'
+              RESP=$(discord_api PATCH "/channels/$THREAD_ID" "$ARCHIVE_PAYLOAD")
+              check_http "$RESP" "archive thread"
+              echo "Archived Discord thread."
+            fi
+            exit 0
+          fi
+
+          echo "Unhandled event: $EVENT_NAME/$ACTION"
+          exit 0
