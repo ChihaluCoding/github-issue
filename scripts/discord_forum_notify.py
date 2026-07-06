@@ -154,14 +154,15 @@ def update_thread(
     r.raise_for_status()
 
 
-def fetch_issues(repo: str, since_iso: str) -> list[dict]:
+def fetch_issues(repo: str, since_iso: str | None) -> list[dict]:
     params = {
         "state": "all",
-        "since": since_iso,
         "sort": "updated",
         "direction": "asc",
         "per_page": 100,
     }
+    if since_iso:
+        params["since"] = since_iso
     r = requests.get(
         f"{GH_API}/repos/{repo}/issues",
         headers=GH_HEADERS,
@@ -179,8 +180,10 @@ def fetch_issues(repo: str, since_iso: str) -> list[dict]:
     return [i for i in items if "pull_request" not in i]
 
 
-def fetch_comments(repo: str, number: int, since_iso: str) -> list[dict]:
-    params = {"since": since_iso, "per_page": 100}
+def fetch_comments(repo: str, number: int, since_iso: str | None) -> list[dict]:
+    params = {"per_page": 100}
+    if since_iso:
+        params["since"] = since_iso
     r = requests.get(
         f"{GH_API}/repos/{repo}/issues/{number}/comments",
         headers=GH_HEADERS,
@@ -235,7 +238,23 @@ def process_repo(repo: str, state: dict, last_run: str) -> None:
                 "last_comment_id": 0,
                 "state": issue_state,
             }
-            print(f"  スレッド作成 #{number} -> thread {thread_id}")
+            # 過去コメントの最大IDを取得して、過去分をスパムしないようにする
+            existing_comments = fetch_comments(repo, number, None)
+            max_comment_id = max((c["id"] for c in existing_comments), default=0)
+            state["issues"][key]["last_comment_id"] = max_comment_id
+            print(f"  スレッド作成 #{number} -> thread {thread_id} (過去コメント {len(existing_comments)}件をスキップ)")
+            # 既にクローズ済みのIssueならスレッドをアーカイブ
+            if issue_state == "closed":
+                try:
+                    update_thread(
+                        thread_id,
+                        tags=[TAG_CLOSED] if TAG_CLOSED else None,
+                        archived=True,
+                        locked=True,
+                    )
+                    print(f"  #{number} 既存のクローズ済みIssueのためスレッドをアーカイブ")
+                except requests.HTTPError as exc:
+                    print(f"  [warn] #{number} アーカイブ失敗: {exc}")
             prev = state["issues"][key]
         else:
             thread_id = prev["thread_id"]
@@ -343,13 +362,11 @@ def main() -> int:
     new_run_time = now_iso()
 
     if last_run is None:
-        print(f"初回実行です。ベースライン時刻を {new_run_time} に設定して終了します（通知は送信しません）。")
-        state["last_run"] = new_run_time
-        save_state(state)
-        return 0
-
-    if args.since:
-        print(f"--since によりベースラインを上書き: {last_run}")
+        print("初回実行です。既存のIssueを全て取得してDiscordに投稿します（過去コメントはスキップ）。")
+        last_run = None
+    else:
+        if args.since:
+            print(f"--since によりベースラインを上書き: {last_run}")
 
     print(f"前回実行時刻: {last_run}")
     try:
